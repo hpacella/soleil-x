@@ -209,6 +209,16 @@ Exports.Config = {
     -- temperature probes
     probes = UpTo(5, Exports.Volume),
   },
+  ID = {
+    ID_rel_tol = double,
+    subsampling_x1 = int,
+    subsampling_x2 = int,
+    subsampling_x3 = int,
+    rank_multiplier = double,
+    no_tstep_intervals = int,
+    save_interval = double,
+  },
+
 }
 
 -- Dual-section simulation config

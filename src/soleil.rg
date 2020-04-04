@@ -177,6 +177,10 @@ local HDF_PARTICLES = (require 'hdf_helper')(int1d, int3d, Particles_columns,
                                              Particles_primitives,
                                              {timeStep=int,simTime=double})
 
+local ID_HELPER = (require 'id_euler_tasks_soleil')('rho', Fluid_columns)
+
+local ID_LA = (require 'id_linear_alg_soleil')
+
 -------------------------------------------------------------------------------
 -- CONSTANTS
 -------------------------------------------------------------------------------
@@ -4173,6 +4177,12 @@ local function mkInstance() local INSTANCE = {}
     yRealOrigin = regentlib.newsymbol(),
     zRealOrigin = regentlib.newsymbol(),
   }
+
+  local NX = regentlib.newsymbol()
+  local NY = regentlib.newsymbol()
+  local NZ = regentlib.newsymbol()
+  local numTiles = regentlib.newsymbol()
+
   local BC = {
     xPosSign = regentlib.newsymbol(double[3]),
     xNegSign = regentlib.newsymbol(double[3]),
@@ -4196,10 +4206,6 @@ local function mkInstance() local INSTANCE = {}
     yBCParticles = regentlib.newsymbol(SCHEMA.ParticlesBC),
     zBCParticles = regentlib.newsymbol(SCHEMA.ParticlesBC),
   }
-  local NX = regentlib.newsymbol()
-  local NY = regentlib.newsymbol()
-  local NZ = regentlib.newsymbol()
-  local numTiles = regentlib.newsymbol()
 
   local Integrator_deltaTime = regentlib.newsymbol()
   local Integrator_simTime = regentlib.newsymbol()
@@ -4226,6 +4232,35 @@ local function mkInstance() local INSTANCE = {}
   local p_TradeQueue_bySrc = UTIL.generate(26, regentlib.newsymbol)
   local p_TradeQueue_byDst = UTIL.generate(26, regentlib.newsymbol)
   local p_Radiation = regentlib.newsymbol()
+
+  local ID = {
+    total_points = regentlib.newsymbol(),
+    total_sub_points = regentlib.newsymbol(),
+    no_tstep_intervals = regentlib.newsymbol(),
+    target_rank = regentlib.newsymbol(),
+    n = regentlib.newsymbol(),
+    tol = regentlib.newsymbol(),
+    A_c = regentlib.newsymbol(),
+    S = regentlib.newsymbol(),
+    T_i = regentlib.newsymbol(),
+    T_i_piv = regentlib.newsymbol(),
+    P_i = regentlib.newsymbol(),
+    P_prime = regentlib.newsymbol(),
+    P_final = regentlib.newsymbol(),
+    global_piv = regentlib.newsymbol(),
+    final_k = regentlib.newsymbol(),
+  }
+
+  local p_tol = regentlib.newsymbol()
+  local p_A_c = regentlib.newsymbol()
+  local p_S = regentlib.newsymbol()
+  local p_T_i = regentlib.newsymbol()
+  local p_T_i_piv = regentlib.newsymbol()
+  local p_P_i = regentlib.newsymbol()
+  local p_P_prime = regentlib.newsymbol()
+  local p_P_final = regentlib.newsymbol()
+  local p_global_piv = regentlib.newsymbol()
+  local p_final_k = regentlib.newsymbol()
 
   -----------------------------------------------------------------------------
   -- Exported symbols
@@ -4346,6 +4381,18 @@ local function mkInstance() local INSTANCE = {}
       config.Integrator.rkOrder >= RK_MIN_ORDER and
       config.Integrator.rkOrder <= RK_MAX_ORDER,
       'Unsupported RK integration scheme')
+
+    var [ID.total_points] = config.Grid.xNum + 2*Grid.xBnum + config.Grid.yNum + 2*Grid.yBnum + config.Grid.zNum + 2*Grid.zBnum
+
+    var [ID.total_sub_points] = (config.Grid.xNum + 2*Grid.xBnum)/config.ID.subsampling_x1 + 
+                                (config.Grid.yNum + 2*Grid.yBnum)/config.ID.subsampling_x2 + 
+                                (config.Grid.zNum + 2*Grid.zBnum)/config.ID.subsampling_x3
+
+    var [ID.no_tstep_intervals] = config.ID.no_tstep_intervals
+
+    var [ID.target_rank] = config.Integrator.maxIter*config.ID.rank_multiplier/ID.no_tstep_intervals
+
+    var [ID.n] = config.Integrator.maxIter
 
     var [Particles_number] = int64(0)
 
@@ -4620,6 +4667,39 @@ local function mkInstance() local INSTANCE = {}
     var [Radiation] = region(is_Radiation, Radiation_columns);
     [UTIL.emitRegionTagAttach(Radiation, MAPPER.SAMPLE_ID_TAG, sampleId, int)];
 
+    -- Create ID Regions 
+    
+    var is_tol = ispace(int3d, {x = NX, y = NY, z = NZ})
+    var [ID.tol] = region(is_tol, double)
+
+    var is_A_c = ispace(int3d, {x = NX*ID.total_sub_points/numTiles, y = NY*ID.no_tstep_intervals*ID.target_rank, z = NZ})
+    var [ID.A_c] = region(is_A_c, double)
+
+    var is_T_i = ispace(int3d, {x = NX*ID.total_sub_points/numTiles, y = NY*ID.no_tstep_intervals*ID.target_rank, z = NZ})
+    var [ID.T_i] = region(is_T_i, double)
+
+    var is_T_i_piv = ispace(int3d, {x = NX, y = NY*ID.n/ID.no_tstep_intervals, z = NZ})
+    var [ID.T_i_piv] = region(is_T_i_piv, int)
+
+    var is_P_i = ispace(int3d, {x = NX*ID.target_rank, y = NY*ID.n, z = NZ})
+    var [ID.P_i] = region(is_P_i, double)
+
+    var is_P_prime = ispace(int3d, {x = NX*ID.no_tstep_intervals*ID.target_rank, y = NY*ID.no_tstep_intervals*ID.target_rank, z = NZ})
+    var [ID.P_prime] = region(is_P_prime, double)
+
+    var is_P_final = ispace(int3d, {x = NX*ID.no_tstep_intervals*ID.target_rank, y = NY*ID.n, z = NZ})
+    var [ID.P_final] = region(is_P_final, double)
+
+    var is_global_piv = ispace(int3d, {x = NX, y = NY*ID.target_rank*ID.no_tstep_intervals, z = NZ})
+    var [ID.global_piv] = region(is_global_piv, int)
+
+
+    var is_final_k = ispace(int3d, {x = NX, y = NY, z = NZ})
+    var [ID.final_k] = region(is_final_k, int)
+
+    var is_S = ispace(int3d, {x = NX*ID.total_points/numTiles, y = NY*ID.no_tstep_intervals*ID.target_rank, z = NZ})
+    var [ID.S] = region(is_S, double)
+    
     -- Partitioning domain
     var [tiles] = ispace(int3d, {NX,NY,NZ})
 
@@ -4630,6 +4710,47 @@ local function mkInstance() local INSTANCE = {}
     var [p_Fluid_copy] =
       [UTIL.mkPartitionByTile(int3d, int3d, Fluid_columns)]
       (Fluid_copy, tiles, int3d{Grid.xBnum,Grid.yBnum,Grid.zBnum}, int3d{0,0,0})
+
+    -- ID Partitioning
+    var [p_tol] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.tol, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_A_c] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.A_c, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_S] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.S, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_T_i] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.T_i, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_T_i_piv] =
+      [UTIL.mkPartitionByTile(int3d, int3d, int)]
+      (ID.T_i_piv, tiles, int3d{0,0,0}, int3d{0,0,0})
+  
+    var [p_P_i] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.P_i, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_P_prime] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.P_prime, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_P_final] =
+      [UTIL.mkPartitionByTile(int3d, int3d, double)]
+      (ID.P_final, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_global_piv] =
+      [UTIL.mkPartitionByTile(int3d, int3d, int)]
+      (ID.global_piv, tiles, int3d{0,0,0}, int3d{0,0,0})
+
+    var [p_final_k] =
+      [UTIL.mkPartitionByTile(int3d, int3d, int)]
+      (ID.final_k, tiles, int3d{0,0,0}, int3d{0,0,0})
 
     -- Particles Partitioning
     var [p_Particles] =
@@ -4978,7 +5099,19 @@ local function mkInstance() local INSTANCE = {}
       end
       Probe_Write(0, config, i, Integrator_timeStep, avgFluidT, avgParticleT, avgCellOfParticleT)
     end
+   --[[ location of ID tasks within fluid loop
 
+   --subsample data and flatten into a column vector
+   var column_index = fmod(current_iteration, config.Integrator.maxIter/config.ID.no_tstep_intervals)
+   ID.flatten_3d_to_vector_subsampled(Fluid, T_i, column_index, config.ID.subsampling_x1, config.ID.subsampling_x2,
+                                      config.ID.subsampling_x3)
+
+   --perform ID analysis if necessary
+   if column_index == 0 then
+     ID.complete_ID_on_T_i(T_i, T_i_pivot, (current_iteration - 1), target_rank, P_i, global_piv, A_c, n, 
+                           config.ID.no_tstep_intervals)
+   end
+   ]]--
     -- Dump restart files
     if config.IO.wrtRestart then
       if Integrator_exitCond or Integrator_timeStep % config.IO.restartEveryTimeSteps == 0 then
@@ -5436,7 +5569,22 @@ local function mkInstance() local INSTANCE = {}
 
     -- Wait for everything above to finish
     __fence(__execution, __block)
+  
+    -- Perform final ID analysis
+    --[[
+    --MGSQR on data from Piecewise ID
+    ID_LA.complete_ID(A_c, global_piv, tol, final_k, P_prime)
 
+    --form final coefficient matrix
+    ID_LA.compute_final_P(P_final, P_i, P_prime, config.no_tstep_intervals, target_rank, final_k)
+
+    --interpolate back to the original grid
+    ID.trilinear_interp(A_c, S, final_k, 
+                        config.nx1/config.blocks_per_dir_x1, config.nx2/config.blocks_per_dir_x2, 
+                        config.nx3/config.blocks_per_dir_x3, config.dx1, config.dx2, config.dx3, 
+                        config.nx1, config.nx2, config.nx3, config.subsampling_x1, config.subsampling_x2, 
+                        config.subsampling_x3, c.x, c.y, c.z)
+    ]]--
   end end -- Cleanup
 
 return INSTANCE end -- mkInstance
